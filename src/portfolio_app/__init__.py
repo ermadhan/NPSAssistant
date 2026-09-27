@@ -1,0 +1,1 @@
+"""Local NPS statement reader."""

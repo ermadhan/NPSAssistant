@@ -1,0 +1,63 @@
+{
+  "name": "cra_transaction_statement_v1",
+  "sections": {
+    "summary": {
+      "required": [
+        "holdings_value",
+        "contribution_count",
+        "total_contribution",
+        "total_withdrawal",
+        "notional_gain",
+        "charges"
+      ],
+      "aliases": {
+        "holdings_value": ["value of your holdings"],
+        "contribution_count": ["no of contributions"],
+        "total_contribution": ["total contribution"],
+        "total_withdrawal": ["total withdrawal"],
+        "notional_gain": ["notional gain"],
+        "charges": ["intermediary charges"]
+      }
+    },
+    "schemes": {
+      "required": ["particulars", "scheme_value", "units", "nav"],
+      "aliases": {
+        "particulars": ["particulars"],
+        "scheme_value": ["scheme wise value"],
+        "units": ["total units"],
+        "nav": ["nav as on"]
+      }
+    },
+    "contributions": {
+      "required": ["date", "particulars", "uploaded_by", "employee", "employer", "total"],
+      "aliases": {
+        "date": ["date"],
+        "particulars": ["particulars"],
+        "uploaded_by": ["uploaded by"],
+        "employee": ["employee contribution"],
+        "employer": ["employer"],
+        "total": ["total"]
+      }
+    },
+    "transactions": {
+      "required": ["date", "description", "amount", "nav", "units"],
+      "aliases": {
+        "date": ["date"],
+        "description": ["description"],
+        "amount": ["amount"],
+        "nav": ["nav"],
+        "units": ["units"]
+      }
+    }
+  },
+  "narrations": {
+    "opening": ["opening balance"],
+    "closing": ["closing balance"],
+    "billing": ["billing for"],
+    "voluntary": ["by voluntary contributions"],
+    "employer": ["by contribution for"],
+    "tier2": ["tier-2 contribution", "tier 2 contribution"],
+    "switch_out": ["to withdrawal on account of subscriber initiated scheme preference change"],
+    "switch_in": ["by contribution on account of subscriber initiated scheme preference change"]
+  }
+}
