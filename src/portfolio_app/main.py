@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from portfolio_app.service import (
     save_header_profile,
     save_statement,
 )
+from portfolio_app.nav import fetch_latest
 
 NARRATION_KINDS = (
     "opening",
@@ -43,7 +45,7 @@ def start(page: ft.Page) -> None:
     picker = ft.FilePicker()
     connection = db.connect()
     app = PortfolioApp(page, connection, picker)
-    page.add(app.toolbar, app.status, app.body)
+    page.add(app.toolbar, app.status_area, app.body)
     app.show_holdings()
 
 
@@ -58,22 +60,27 @@ class PortfolioApp:
         self.catalog = []
         self.narration_inputs: dict[str, ft.Dropdown] = {}
         self.header_inputs: dict[tuple[str, str], ft.Dropdown] = {}
+        self.busy = False
         self.confirm_year = ft.Checkbox(label="The filename year and the dates disagree. Save using the dates.", value=False)
         self.status = ft.Text("")
+        self.progress = ft.ProgressRing(visible=False, width=18, height=18, stroke_width=2)
+        self.status_area = ft.Row(controls=[self.progress, self.status], spacing=8)
         self.body = ft.Column(spacing=12)
+        self.toolbar_buttons = [
+            ft.FilledButton("Holdings", on_click=self.show_holdings),
+            ft.OutlinedButton("Load statement", on_click=self.load_statement),
+            ft.OutlinedButton("Refresh NAVs", on_click=self.refresh_prices),
+            ft.OutlinedButton("Export holdings", on_click=self.export_holdings_file),
+            ft.OutlinedButton("Export transactions", on_click=self.export_transactions_file),
+        ]
         self.toolbar = ft.Row(
             wrap=True,
-            controls=[
-                ft.FilledButton("Holdings", on_click=self.show_holdings),
-                ft.OutlinedButton("Load statement", on_click=self.load_statement),
-                ft.OutlinedButton("Refresh NAVs", on_click=self.refresh_prices),
-                ft.OutlinedButton("Export holdings", on_click=self.export_holdings_file),
-                ft.OutlinedButton("Export transactions", on_click=self.export_transactions_file),
-            ],
+            controls=self.toolbar_buttons,
         )
 
     def show_holdings(self, _event=None) -> None:
         self.selected_import = None
+        self.status.value = "Showing current holdings."
         self._render_portfolio()
 
     def _render_portfolio(self) -> None:
@@ -187,25 +194,34 @@ class PortfolioApp:
 
     def _select_year(self, event) -> None:
         self.selected_import = event.control.data
+        self.status.value = "Showing selected statement."
         self._render_portfolio()
 
     async def load_statement(self, _event=None) -> None:
-        files = await self.picker.pick_files(
-            dialog_title="NPS transaction statement",
-            file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["csv"],
-        )
-        if not files or not files[0].path:
+        if not self._begin_busy("Choose an NPS statement CSV..."):
             return
-        path = Path(files[0].path)
         try:
+            files = await self.picker.pick_files(
+                dialog_title="NPS transaction statement",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["csv"],
+            )
+            if not files or not files[0].path:
+                self.status.value = "Statement import cancelled."
+                return
+            path = Path(files[0].path)
+            self.status.value = f"Reading {path.name}..."
+            self.page.update()
+            await asyncio.sleep(0)
             result = parse_statement(self.connection, path)
         except Exception as error:
-            self._message(str(error))
-            return
-        self.pending_path = path
-        self.pending = result
-        self._show_review()
+            self.status.value = f"Could not load statement: {error}"
+        else:
+            self.pending_path = path
+            self.pending = result
+            self._show_review()
+        finally:
+            self._end_busy()
 
     def _show_review(self) -> None:
         result = self.pending
@@ -279,7 +295,16 @@ class PortfolioApp:
         self.body.controls = controls
         self.page.update()
 
-    def save_review(self, _event=None) -> None:
+    async def save_review(self, _event=None) -> None:
+        if not self._begin_busy("Saving statement..."):
+            return
+        try:
+            await asyncio.sleep(0)
+            self._save_review()
+        finally:
+            self._end_busy()
+
+    def _save_review(self) -> None:
         result = self.pending
         path = self.pending_path
         if result is None or path is None:
@@ -323,43 +348,89 @@ class PortfolioApp:
         self.show_holdings()
 
     async def refresh_prices(self, _event=None) -> None:
-        self._message("Fetching NAVs from npsnav.in...")
-        try:
-            outcome = refresh_navs(self.connection)
-        except Exception as error:
-            self._message(f"NAV fetch failed: {error}")
+        if not self._begin_busy("Fetching latest NAVs from npsnav.in..."):
             return
-        self.catalog = outcome["catalog"]
-        self._message(
-            f"Linked {len(outcome['linked'])}. "
-            f"Unmatched {len(outcome['unmatched'])}. "
-            f"Ambiguous {len(outcome['ambiguous'])}."
-        )
-        self._render_portfolio()
+        try:
+            catalog = await asyncio.to_thread(fetch_latest)
+            self.status.value = "Saving NAVs and matching schemes..."
+            self.page.update()
+            outcome = refresh_navs(self.connection, catalog)
+        except Exception as error:
+            self.status.value = f"NAV refresh failed: {error}"
+        else:
+            self.catalog = outcome["catalog"]
+            self.status.value = (
+                f"Linked {len(outcome['linked'])}. "
+                f"Unmatched {len(outcome['unmatched'])}. "
+                f"Ambiguous {len(outcome['ambiguous'])}."
+            )
+            self._render_portfolio()
+        finally:
+            self._end_busy()
 
     async def export_holdings_file(self, _event=None) -> None:
-        target = await self.picker.save_file(
-            dialog_title="Export holdings",
-            file_name="holdings.xlsx",
-            file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["xlsx", "csv"],
-        )
-        if not target:
+        if not self._begin_busy("Choose where to save holdings..."):
             return
-        export_holdings(self.connection, Path(target), self.selected_import)
-        self._message(f"Wrote {target}")
+        try:
+            target = await self.picker.save_file(
+                dialog_title="Export holdings",
+                file_name="holdings.xlsx",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["xlsx", "csv"],
+            )
+            if not target:
+                self.status.value = "Holdings export cancelled."
+                return
+            self.status.value = "Writing holdings export..."
+            self.page.update()
+            await asyncio.sleep(0)
+            export_holdings(self.connection, Path(target), self.selected_import)
+            self.status.value = f"Wrote {target}"
+        except Exception as error:
+            self.status.value = f"Holdings export failed: {error}"
+        finally:
+            self._end_busy()
 
     async def export_transactions_file(self, _event=None) -> None:
-        target = await self.picker.save_file(
-            dialog_title="Export transactions",
-            file_name="transactions.xlsx",
-            file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["xlsx", "csv"],
-        )
-        if not target:
+        if not self._begin_busy("Choose where to save transactions..."):
             return
-        export_transactions(self.connection, Path(target), self.selected_import)
-        self._message(f"Wrote {target}")
+        try:
+            target = await self.picker.save_file(
+                dialog_title="Export transactions",
+                file_name="transactions.xlsx",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["xlsx", "csv"],
+            )
+            if not target:
+                self.status.value = "Transactions export cancelled."
+                return
+            self.status.value = "Writing transactions export..."
+            self.page.update()
+            await asyncio.sleep(0)
+            export_transactions(self.connection, Path(target), self.selected_import)
+            self.status.value = f"Wrote {target}"
+        except Exception as error:
+            self.status.value = f"Transactions export failed: {error}"
+        finally:
+            self._end_busy()
+
+    def _begin_busy(self, message: str) -> bool:
+        if self.busy:
+            return False
+        self.busy = True
+        self.status.value = message
+        self.progress.visible = True
+        for button in self.toolbar_buttons:
+            button.disabled = True
+        self.page.update()
+        return True
+
+    def _end_busy(self) -> None:
+        self.busy = False
+        self.progress.visible = False
+        for button in self.toolbar_buttons:
+            button.disabled = False
+        self.page.update()
 
     def _message(self, text: str) -> None:
         self.status.value = text
