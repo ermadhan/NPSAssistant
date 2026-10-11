@@ -3,6 +3,6 @@
 __pycache__/
 *.py[cod]
 
-# Local NPS transaction statement exports
-/*_Tier*.csv
-/Transaction History*.xls*
+# Local NPS statement and transaction exports
+/*.csv
+/*.xls*

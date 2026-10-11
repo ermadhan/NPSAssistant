@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from portfolio_app.analytics import family_portfolio
 from portfolio_app import db
 from portfolio_app.export import holding_records, transaction_records, write_table
 from portfolio_app.nav import FundNav, fetch_latest, match_scheme
@@ -84,7 +85,30 @@ def export_holdings(
     import_id: int | None = None,
     member_id: str | None = None,
 ) -> None:
-    rows = db.holdings_for_import(connection, import_id) if import_id else db.current_holding_rows(connection)
+    if import_id:
+        rows = db.holdings_for_import(connection, import_id)
+    else:
+        rows = db.current_holding_rows(connection)
+        analytics = family_portfolio(connection)
+        metrics = {
+            (row["member_id"], row["tier"], row["scheme_name"]): row
+            for row in analytics["positions"]
+        }
+        enriched = []
+        for row in rows:
+            record = dict(row)
+            metric = metrics.get(
+                (row["member_id"], row["tier"], row["scheme_name"])
+            )
+            if metric:
+                record.update(
+                    net_invested=metric["net_invested"],
+                    invested_complete=metric["invested_complete"],
+                    calculated_xirr=metric["calculated_xirr"],
+                    reported_xirr=metric["reported_xirr"],
+                )
+            enriched.append(record)
+        rows = enriched
     if member_id is not None:
         rows = [row for row in rows if row["member_id"] == member_id]
     write_table(path, holding_records(rows))

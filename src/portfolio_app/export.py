@@ -37,6 +37,26 @@ def holding_records(rows) -> list[dict]:
                     if row["net_contribution"] is None
                     else float(row["net_contribution"])
                 ),
+                "net_invested": (
+                    row["net_invested"]
+                    if "net_invested" in row.keys()
+                    else row["net_contribution"]
+                ),
+                "invested_complete": (
+                    row["invested_complete"]
+                    if "invested_complete" in row.keys()
+                    else row["net_contribution"] is not None
+                ),
+                "calculated_xirr": (
+                    row["calculated_xirr"]
+                    if "calculated_xirr" in row.keys()
+                    else None
+                ),
+                "statement_xirr": (
+                    row["reported_xirr"]
+                    if "reported_xirr" in row.keys()
+                    else None
+                ),
                 "statement_nav": statement_nav,
                 "statement_nav_date": row["statement_nav_date"],
                 "latest_nav": None if latest is None else float(latest),

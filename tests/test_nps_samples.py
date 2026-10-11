@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from portfolio_app import db  # noqa: E402
+from portfolio_app.analytics import allocation_summary, family_portfolio, xirr  # noqa: E402
 from portfolio_app.nav import FundNav, match_scheme  # noqa: E402
 from portfolio_app.parsers.nps import (  # noqa: E402
     financial_year_for,
@@ -23,27 +24,148 @@ from portfolio_app.service import (  # noqa: E402
     save_statement,
 )
 
-SAMPLES = {
-    "SAMPLE-ACCOUNT-001_Tier1.csv": ("nps_tier1", "2026-27", 7163296.15, None),
-    "SAMPLE-ACCOUNT-001_Tier2.csv": ("nps_tier2", "2026-27", 1302905.98, None),
-    "SAMPLE-ACCOUNT-001_Tier1_2025_26.csv": ("nps_tier1", "2025-26", 6417228.60, "2025-26"),
-    "SAMPLE-ACCOUNT-001_Tier2_2025_26.csv": ("nps_tier2", "2025-26", 1144510.56, "2025-26"),
-    "SAMPLE-ACCOUNT-001_Tier1_2024_25.csv": ("nps_tier1", "2024-25", 5793659.41, "2024-25"),
-    "SAMPLE-ACCOUNT-001_Tier2_2024_25.csv": ("nps_tier2", "2024-25", 972941.40, "2024-25"),
-}
+SAMPLES = [
+    (tier, year)
+    for year in ("2024-25", "2025-26", "2026-27")
+    for tier in ("nps_tier1", "nps_tier2")
+]
 
+NAV_DATE = date(2026, 9, 25)
 FUNDS = [
-    FundNav("SM007001", "ICICI PRUDENTIAL PENSION FUND SCHEME E - TIER I", 1, financial_year_date := __import__("datetime").date(2026, 9, 25)),
-    FundNav("SM007002", "ICICI PRUDENTIAL PENSION FUND SCHEME C - TIER I", 1, financial_year_date),
-    FundNav("SM007003", "ICICI PRUDENTIAL PENSION FUND SCHEME G - TIER I", 1, financial_year_date),
-    FundNav("SM007004", "ICICI PRUDENTIAL PENSION FUND SCHEME E - TIER II", 1, financial_year_date),
-    FundNav("SM007005", "ICICI PRUDENTIAL PENSION FUND SCHEME C - TIER II", 1, financial_year_date),
-    FundNav("SM007006", "ICICI PRUDENTIAL PENSION FUND SCHEME G - TIER II", 1, financial_year_date),
-    FundNav("SM007010", "ICICI PRUDENTIAL PENSION FUNDS SCHEME TAX SAVER TIER II", 1, financial_year_date),
+    FundNav("SM007001", "ICICI PRUDENTIAL PENSION FUND SCHEME E - TIER I", 1, NAV_DATE),
+    FundNav("SM007002", "ICICI PRUDENTIAL PENSION FUND SCHEME C - TIER I", 1, NAV_DATE),
+    FundNav("SM007003", "ICICI PRUDENTIAL PENSION FUND SCHEME G - TIER I", 1, NAV_DATE),
+    FundNav("SM007004", "ICICI PRUDENTIAL PENSION FUND SCHEME E - TIER II", 1, NAV_DATE),
+    FundNav("SM007005", "ICICI PRUDENTIAL PENSION FUND SCHEME C - TIER II", 1, NAV_DATE),
+    FundNav("SM007006", "ICICI PRUDENTIAL PENSION FUND SCHEME G - TIER II", 1, NAV_DATE),
+    FundNav("SM007010", "ICICI PRUDENTIAL PENSION FUNDS SCHEME TAX SAVER TIER II", 1, NAV_DATE),
 ]
 
 
+def _sample_filename(tier: str, year: str) -> str:
+    tier_number = "Tier1" if tier == "nps_tier1" else "Tier2"
+    return f"Sample_{tier_number}_{year.replace('-', '_')}.csv"
+
+
+def _sample_statement(tier: str, year: str) -> str:
+    year_start = int(year[:4])
+    period_index = year_start - 2024
+    tier_roman = "I" if tier == "nps_tier1" else "II"
+    schemes = (
+        ("E", 100.0, 5.0, 0.1, 10.0),
+        ("C", 200.0, 8.0, 0.2, 5.0),
+        ("G", 300.0, 12.0, 0.3, 3.0),
+    )
+    as_of = date(year_start + 1, 3, 31) if year_start < 2026 else date(2026, 9, 27)
+    nav_date = date(as_of.year, as_of.month, min(as_of.day, 25))
+    statement_holdings = []
+    transaction_blocks = []
+    for asset, starting_units, added_units, charge_units, initial_nav in schemes:
+        opening_units = starting_units + period_index * (added_units - charge_units)
+        current_units = opening_units + added_units - charge_units
+        nav = initial_nav + period_index
+        scheme = f"ICICI PRUDENTIAL PENSION FUND SCHEME {asset} - TIER {tier_roman}"
+        value = current_units * nav
+        statement_holdings.append((scheme, value, current_units, nav))
+        opening_day = date(year_start, 4, 1).strftime("%d-%b-%Y")
+        contribution_day = date(year_start, 5, 5).strftime("%d-%b-%Y")
+        billing_day = date(year_start, 6, 5).strftime("%d-%b-%Y")
+        transactions = [
+            f"{opening_day},Opening balance,--,--,{opening_units:.4f}",
+            f"{contribution_day},By Voluntary Contributions,{added_units * nav:.2f},{nav:.4f},{added_units:.4f}",
+            f"{billing_day},Billing for quarterly service,-{charge_units * nav:.2f},{nav:.4f},-{charge_units:.4f}",
+        ]
+        if year_start < 2026:
+            closing_day = date(year_start + 1, 3, 31).strftime("%d-%b-%Y")
+            transactions.append(
+                f"{closing_day},Closing balance,--,--,{current_units:.4f}"
+            )
+        transaction_blocks.append((scheme, transactions))
+
+    holdings_value = sum(value for _, value, _, _ in statement_holdings)
+    total_charges = sum(
+        charge_units * (initial_nav + period_index)
+        for _, _, _, charge_units, initial_nav in schemes
+    )
+    filename_date = as_of.strftime("%b %d %Y")
+    date_text = as_of.strftime("%d-%b-%Y")
+    nav_text = nav_date.strftime("%d-%b-%Y")
+    lines = [
+        f"NPS Transaction Statement for Tier {tier_roman} Account",
+        "Subscriber Details",
+        "PRAN,'SAMPLE-ACCOUNT-001",
+        "Subscriber Name,Sample Member",
+        f"Statement Generation Date :{filename_date} 08:00 AM",
+        "Scheme Choice - ACTIVE CHOICE",
+        "Investment Summary",
+        (
+            f"Value of your Holdings(Investments)as on {filename_date} (in Rs),"
+            f"No of contributions,Total contribution in your account as on {filename_date} (in Rs),"
+            f"Total withdrawal as on {filename_date} (in Rs),"
+            f"Total notional gain/loss as on {filename_date} (in Rs),"
+            f"Withdrawal/ deduction in units towards intermediary charges (in Rs),"
+            "Return on Investment(XIRR),7.50%"
+        ),
+        f"Rs {holdings_value:.2f},1,Rs 250.00,Rs 0.00,Rs {holdings_value - 250:.2f},Rs {total_charges:.2f},",
+        "Investment Details- Scheme Wise Summary",
+        f"Particulars,Scheme wise Value,Total Units,NAV as on {nav_text}",
+    ]
+    lines.extend(
+        f"{scheme},Rs {value:.2f},{units:.4f},{nav:.4f}"
+        for scheme, value, units, nav in statement_holdings
+    )
+    lines.extend(
+        [
+            "Contribution/ Redemption Details",
+            "Date,Particulars,Uploaded By,Employee Contribution(Rs),Employer's Contribution(Rs),Total(Rs)",
+            f"{date(year_start, 5, 5).strftime('%d-%b-%Y')},By Voluntary Contribution,Sample Member,150.00,100.00,250.00",
+            "Transaction Details",
+        ]
+    )
+    for scheme, transactions in transaction_blocks:
+        lines.extend(
+            [
+                scheme,
+                "Date,Description,Amount,Nav,Units",
+                *transactions,
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _sample_result(tier: str, year: str):
+    return parse_nps_text(
+        _sample_statement(tier, year),
+        _sample_filename(tier, year),
+    )
+
+
+def _write_sample(folder: Path, tier: str, year: str) -> Path:
+    path = folder / _sample_filename(tier, year)
+    path.write_text(_sample_statement(tier, year), encoding="utf-8")
+    return path
+
+
 class SampleTests(unittest.TestCase):
+    def test_xirr_calculates_dated_annual_return(self):
+        result = xirr(
+            [
+                (date(2021, 1, 1), -1000.0),
+                (date(2022, 1, 1), 1100.0),
+            ]
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 0.10, places=6)
+        self.assertIsNone(
+            xirr(
+                [
+                    (date(2021, 1, 1), -100.0),
+                    (date(2022, 1, 1), 230.0),
+                    (date(2023, 1, 1), -132.0),
+                ]
+            )
+        )
+
     def test_legacy_2020_statement_layout(self):
         statement = """NPS Transaction Statement for Tier I Account
 Subscriber Details
@@ -146,18 +268,22 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
 
     def test_holdings_totals_and_charges(self):
         parsed = {}
-        for name, (tier, year, total, filename_year) in SAMPLES.items():
-            result = parse_nps_file(ROOT / name)
-            parsed[name] = result
+        for tier, year in SAMPLES:
+            result = _sample_result(tier, year)
+            parsed[(tier, year)] = result
             self.assertFalse(result.needs_header_map, result.header_mapping)
             self.assertEqual(result.unknown_narrations, [])
             self.assertEqual(result.warnings, [])
             self.assertEqual(result.tier, tier)
             self.assertEqual(result.financial_year, year)
-            self.assertEqual(result.filename_year, filename_year)
+            self.assertEqual(result.filename_year, year)
             self.assertFalse(result.year_mismatch)
-            self.assertAlmostEqual(result.holdings_value, total, places=2)
-            self.assertAlmostEqual(sum(row.market_value for row in result.holdings), total, places=2)
+            self.assertGreater(result.holdings_value, 0)
+            self.assertAlmostEqual(
+                sum(row.market_value for row in result.holdings),
+                result.holdings_value,
+                places=2,
+            )
             billing = sum(-row.amount for row in result.transactions if row.narration_kind == "billing")
             self.assertAlmostEqual(billing, result.charges, places=2)
         self._assert_unit_chain(parsed)
@@ -200,8 +326,8 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
     def test_save_current_holdings_and_export(self):
         with tempfile.TemporaryDirectory() as folder:
             connection = db.connect(Path(folder) / "portfolio.db")
-            for name in ("SAMPLE-ACCOUNT-001_Tier1_2024_25.csv", "SAMPLE-ACCOUNT-001_Tier1.csv"):
-                path = ROOT / name
+            for year in ("2024-25", "2026-27"):
+                path = _write_sample(Path(folder), "nps_tier1", year)
                 result = parse_nps_file(path)
                 save_statement(connection, path, result, confirm_year=False, narration_map={})
             refresh_navs(connection, FUNDS)
@@ -211,6 +337,11 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
             target = Path(folder) / "holdings.csv"
             export_holdings(connection, target)
             self.assertIn("SM007001", target.read_text(encoding="utf-8"))
+            with target.open(encoding="utf-8", newline="") as file:
+                exported_columns = next(csv.reader(file))
+            self.assertIn("net_invested", exported_columns)
+            self.assertIn("calculated_xirr", exported_columns)
+            self.assertIn("statement_xirr", exported_columns)
             workbook = Path(folder) / "transactions.xlsx"
             export_transactions(connection, workbook)
             self.assertTrue(workbook.stat().st_size > 0)
@@ -219,22 +350,31 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
     def test_current_holdings_are_isolated_by_subscriber(self):
         with tempfile.TemporaryDirectory() as folder:
             connection = db.connect(Path(folder) / "portfolio.db")
-            result = parse_nps_file(ROOT / "SAMPLE-ACCOUNT-001_Tier1.csv")
+            result = _sample_result("nps_tier1", "2026-27")
             db.save_import(connection, result, "member-one.csv", "hash-member-one")
 
-            member_two = replace(result, pran="member_two-PRAN", subscriber_name="member_two")
-            db.save_import(connection, member_two, "member_two.csv", "hash-member_two")
-            newer_wife = replace(member_two, as_of_date=date(2026, 10, 1))
-            db.save_import(connection, newer_wife, "member_two-new.csv", "hash-member_two-new")
+            member_two = replace(
+                result,
+                pran="SAMPLE-ACCOUNT-002",
+                subscriber_name="Sample Member Two",
+            )
+            db.save_import(connection, member_two, "member-two.csv", "hash-member-two")
+            newer_member_two = replace(member_two, as_of_date=date(2026, 10, 1))
+            db.save_import(
+                connection,
+                newer_member_two,
+                "member-two-new.csv",
+                "hash-member-two-new",
+            )
 
             rows = db.current_holding_rows(connection)
             self.assertEqual(
                 {row["subscriber_name"] for row in rows},
-                {result.subscriber_name, "member_two"},
+                {result.subscriber_name, member_two.subscriber_name},
             )
             self.assertEqual(
                 {row["subscriber_name"] for row in db.list_years(connection)},
-                {result.subscriber_name, "member_two"},
+                {result.subscriber_name, member_two.subscriber_name},
             )
             self.assertEqual(
                 connection.execute(
@@ -242,20 +382,129 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
                 ).fetchone()[0],
                 2,
             )
-            holdings_path = Path(folder) / "member_two-holdings.csv"
-            export_holdings(connection, holdings_path, member_id="member_two-PRAN")
+            holdings_path = Path(folder) / "member-two-holdings.csv"
+            export_holdings(
+                connection,
+                holdings_path,
+                member_id="SAMPLE-ACCOUNT-002",
+            )
             with holdings_path.open(encoding="utf-8", newline="") as file:
                 self.assertEqual(
                     {row["subscriber"] for row in csv.DictReader(file)},
-                    {"member_two"},
+                    {member_two.subscriber_name},
                 )
-            transactions_path = Path(folder) / "member_two-transactions.csv"
-            export_transactions(connection, transactions_path, member_id="member_two-PRAN")
+            transactions_path = Path(folder) / "member-two-transactions.csv"
+            export_transactions(
+                connection,
+                transactions_path,
+                member_id="SAMPLE-ACCOUNT-002",
+            )
             with transactions_path.open(encoding="utf-8", newline="") as file:
                 self.assertEqual(
                     {row["subscriber"] for row in csv.DictReader(file)},
-                    {"member_two"},
+                    {member_two.subscriber_name},
                 )
+            connection.close()
+
+    def test_family_allocation_rolls_up_member_tier_and_asset_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            connection = db.connect(Path(folder) / "portfolio.db")
+            result = _sample_result("nps_tier1", "2026-27")
+            db.save_import(connection, result, "member-one.csv", "allocation-member-one")
+            tier2 = _sample_result("nps_tier2", "2026-27")
+            db.save_import(connection, tier2, "member-one-tier2.csv", "allocation-member-one-tier2")
+            member_two = replace(
+                result,
+                pran="SAMPLE-ACCOUNT-002",
+                subscriber_name="Sample Member Two",
+            )
+            db.save_import(
+                connection,
+                member_two,
+                "member-two.csv",
+                "allocation-member-two",
+            )
+            member_two_tier2 = replace(
+                tier2,
+                pran="SAMPLE-ACCOUNT-002",
+                subscriber_name="Sample Member Two",
+            )
+            db.save_import(
+                connection,
+                member_two_tier2,
+                "member-two-tier2.csv",
+                "allocation-member-two-tier2",
+            )
+
+            portfolio = family_portfolio(connection)
+            rows = allocation_summary(portfolio["positions"])
+            by_name = {row["member"]: row for row in rows}
+            expected_one = result.holdings_value + tier2.holdings_value
+            self.assertAlmostEqual(
+                by_name["Family total"]["current_value"],
+                expected_one * 2,
+                delta=0.1,
+            )
+            self.assertAlmostEqual(
+                by_name[result.subscriber_name]["current_value"],
+                expected_one,
+                delta=0.1,
+            )
+            self.assertAlmostEqual(
+                by_name[member_two.subscriber_name]["current_value"],
+                expected_one,
+                delta=0.1,
+            )
+            family = by_name["Family total"]
+            for asset in ("Equity", "Corporate", "Government"):
+                self.assertGreater(family["asset_totals"][asset]["current_value"], 0)
+                self.assertAlmostEqual(
+                    family["asset_totals"][asset]["current_value"],
+                    sum(
+                        position["current_value"]
+                        for position in portfolio["positions"]
+                        if position["asset_class"] == asset
+                    ),
+                )
+            self.assertAlmostEqual(
+                sum(
+                    value["current_value"]
+                    for value in family["categories"].values()
+                ),
+                family["current_value"],
+            )
+            self.assertEqual(len(portfolio["reported_xirr"]), 4)
+            connection.close()
+
+    def test_account_xirr_uses_multi_year_transaction_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            connection = db.connect(Path(folder) / "portfolio.db")
+            previous = _sample_result("nps_tier1", "2024-25")
+            current = _sample_result("nps_tier1", "2025-26")
+            db.save_import(connection, previous, "previous.csv", "xirr-previous")
+            db.save_import(connection, current, "current.csv", "xirr-current")
+
+            portfolio = family_portfolio(connection)
+            account_return = next(
+                row
+                for row in portfolio["calculated_xirr"]
+                if row["member_id"] == current.pran
+                and row["tier"] == current.tier
+            )
+            self.assertIsNotNone(account_return["calculated_xirr"])
+            statement_return = next(
+                row
+                for row in portfolio["reported_xirr"]
+                if row["member_id"] == current.pran
+                and row["tier"] == current.tier
+            )
+            self.assertEqual(statement_return["reported_xirr"], current.xirr)
+            self.assertTrue(
+                all(
+                    position["calculated_xirr"] is not None
+                    for position in portfolio["positions"]
+                )
+            )
             connection.close()
 
 

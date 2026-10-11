@@ -287,7 +287,8 @@ def list_years(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
         SELECT i.id, i.tier, i.financial_year, i.file_name, s.as_of_date, s.holdings_value,
-               s.subscriber_name, s.pran
+               s.subscriber_name, s.pran, s.xirr,
+               COALESCE(NULLIF(s.pran, ''), s.subscriber_name) AS member_id
         FROM imports i
         JOIN account_snapshots s ON s.import_id = i.id
         WHERE i.is_current = 1
@@ -301,7 +302,8 @@ def current_holding_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         """
         SELECT h.*, s.as_of_date, s.subscriber_name, s.pran,
                COALESCE(NULLIF(s.pran, ''), s.subscriber_name) AS member_id,
-               i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date
+               i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date,
+               q.nav_date AS nav_date
         FROM holdings h
         JOIN imports i ON i.id = h.import_id
         JOIN account_snapshots s ON s.import_id = i.id
