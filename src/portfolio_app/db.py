@@ -112,6 +112,28 @@ def _migrate(connection: sqlite3.Connection) -> None:
             nav_date TEXT NOT NULL,
             fetched_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS security_disclosures (
+            id INTEGER PRIMARY KEY,
+            fund_manager TEXT NOT NULL,
+            disclosure_date TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(fund_manager, disclosure_date)
+        );
+        CREATE TABLE IF NOT EXISTS security_positions (
+            id INTEGER PRIMARY KEY,
+            disclosure_id INTEGER NOT NULL REFERENCES security_disclosures(id) ON DELETE CASCADE,
+            scheme_asset TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            security_name TEXT NOT NULL,
+            isin TEXT NOT NULL,
+            industry TEXT NOT NULL,
+            instrument_type TEXT NOT NULL,
+            quantity REAL,
+            market_value REAL NOT NULL,
+            portfolio_weight REAL NOT NULL,
+            rating TEXT NOT NULL
+        );
         """
     )
     holding_columns = {
@@ -120,6 +142,74 @@ def _migrate(connection: sqlite3.Connection) -> None:
     if "net_contribution" not in holding_columns:
         connection.execute("ALTER TABLE holdings ADD COLUMN net_contribution REAL")
     connection.commit()
+
+
+def save_security_disclosure(connection: sqlite3.Connection, disclosure, fetched_at: datetime) -> None:
+    connection.execute(
+        """
+        INSERT INTO security_disclosures (
+            fund_manager, disclosure_date, source_url, fetched_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(fund_manager, disclosure_date) DO UPDATE SET
+            source_url = excluded.source_url,
+            fetched_at = excluded.fetched_at
+        """,
+        (
+            disclosure.fund_manager,
+            disclosure.as_of_date.isoformat(),
+            disclosure.source_url,
+            fetched_at.isoformat(timespec="seconds"),
+        ),
+    )
+    disclosure_id = connection.execute(
+        "SELECT id FROM security_disclosures WHERE fund_manager = ? AND disclosure_date = ?",
+        (disclosure.fund_manager, disclosure.as_of_date.isoformat()),
+    ).fetchone()["id"]
+    connection.execute(
+        "DELETE FROM security_positions WHERE disclosure_id = ?",
+        (disclosure_id,),
+    )
+    connection.executemany(
+        """
+        INSERT INTO security_positions (
+            disclosure_id, scheme_asset, tier, security_name, isin, industry,
+            instrument_type, quantity, market_value, portfolio_weight, rating
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                disclosure_id,
+                row.scheme_asset,
+                row.tier,
+                row.security_name,
+                row.isin,
+                row.industry,
+                row.instrument_type,
+                row.quantity,
+                row.market_value,
+                row.portfolio_weight,
+                row.rating,
+            )
+            for row in disclosure.positions
+        ],
+    )
+    connection.commit()
+
+
+def latest_security_disclosures(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT p.*, d.fund_manager, d.disclosure_date, d.source_url, d.fetched_at
+        FROM security_positions p
+        JOIN security_disclosures d ON d.id = p.disclosure_id
+        WHERE d.disclosure_date = (
+            SELECT MAX(latest.disclosure_date)
+            FROM security_disclosures latest
+            WHERE latest.fund_manager = d.fund_manager
+        )
+        ORDER BY d.fund_manager, p.scheme_asset, p.tier, p.market_value DESC
+        """
+    ).fetchall()
 
 
 def file_hash_exists(connection: sqlite3.Connection, file_hash: str) -> bool:

@@ -3,8 +3,11 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
+
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -12,6 +15,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from portfolio_app import db  # noqa: E402
 from portfolio_app.analytics import allocation_summary, family_portfolio, xirr  # noqa: E402
 from portfolio_app.nav import FundNav, match_scheme  # noqa: E402
+from portfolio_app.main import (  # noqa: E402
+    PortfolioApp,
+    _allocation_bucket_table,
+    _allocation_total_table,
+    _format_inr,
+    _holdings_summary_table,
+)
 from portfolio_app.parsers.nps import (  # noqa: E402
     financial_year_for,
     parse_nps_file,
@@ -22,6 +32,13 @@ from portfolio_app.service import (  # noqa: E402
     export_transactions,
     refresh_navs,
     save_statement,
+    save_security_disclosure,
+)
+from portfolio_app.securities import (
+    build_security_exposure,
+    parse_hdfc_disclosure,
+    parse_icici_disclosure,
+    parse_lic_disclosure,
 )
 
 SAMPLES = [
@@ -146,7 +163,97 @@ def _write_sample(folder: Path, tier: str, year: str) -> Path:
     return path
 
 
+def _security_workbook() -> bytes:
+    rows = [
+        ["Name of the Pension Fund", "ICICI Pension Fund"],
+        ["Name of the scheme", "Scheme E- Tier I"],
+        ["Portfolio Statement as on", datetime(2026, 9, 30)],
+        [""] * 7,
+        [""] * 7,
+        ["Particulars", "ISIN No.", "Industry", "Quantity", "Market Value", "% of Portfolio", "Rating"],
+        ["Equity Instruments"],
+        ["Shares"],
+        ["Sample Equity Ltd", "INE000A01000", "Technology", 10, 600.0, 0.6, ""],
+        ["Debt Instruments"],
+        ["Sample Corporate Bond", "INE000B01000", "Finance", 4, 300.0, 0.3, "AAA"],
+        ["Cash/Cash equivalent & Net Current Assets", "", "", "", 100.0, 0.1, ""],
+        ["GRAND TOTAL", "", "", 14, 1000.0, 1.0, ""],
+    ]
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(
+            writer,
+            sheet_name="Scheme E - Tier l",
+            index=False,
+            header=False,
+        )
+    return buffer.getvalue()
+
+
+def _hdfc_workbook() -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for asset, tier, instrument, isin, weight in (
+            ("E", "I", "Sample HDFC Equity", "INE000A01000", 1.0),
+            ("G", "II", "7% GOI 2030", "IN0020260001", 1.0),
+        ):
+            rows = [
+                ["PENSION FUND MANAGER NAME : HDFC PENSION FUND"],
+                ["STATEMENT AS ON", "30 SEPTEMBER 2026"],
+                ["DETAILS OF PORTFOLIO FOR - SCHEME"],
+                ["PARTICULARS", "ISIN NO.", "INDUSTRY", "QUANTITY", "TOTAL MARKET VALUE", "% OF PORTFOLIO", "RATINGS"],
+                ["EQUITY INSTRUMENTS" if asset == "E" else "DEBT INSTRUMENTS"],
+                [instrument, isin, "Industry", 10, 1000.0, weight, ""],
+                ["GRAND TOTAL", "", "", 10, 1000.0, 1.0, ""],
+            ]
+            pd.DataFrame(rows).to_excel(
+                writer,
+                sheet_name=f"Scheme {asset}-Tier-{tier}",
+                index=False,
+                header=False,
+            )
+    return buffer.getvalue()
+
+
+def _lic_workbook() -> bytes:
+    rows = [
+        ["Name of the Pension Fund : LIC PENSION FUND LIMITED"],
+        ["Name of the scheme : LIC PENSION FUND SCHEME E - TIER I"],
+        ["Portfolio Statement as on :", "30-09-2026"],
+        [""] * 7,
+        ["PARTICULARS", "ISIN NO.", "INDUSTRY", "QUANTITY", "TOTAL MARKET VALUE", "% OF PORTFOLIO", "RATINGS"],
+        ["Government Securities and Related Investments"],
+        ["Equity"],
+        ["Sample LIC Equity", "INE000A01000", "Technology", 10, 600.0, 0.6, ""],
+        ["", "", "Sub Total", 10, 600.0, 0.6, ""],
+        ["Debt Instruments and Related Investments"],
+        ["7% Corporate Bond", "INE000B01000", "Finance", 4, 200.0, 0.2, "AAA"],
+        ["Government Securities"],
+        ["7% GOI 2030", "IN0020260001", "Government", 2, 100.0, 0.1, "SOV"],
+        ["Mutual Fund Units"],
+        ["SBI Overnight Fund", "INF200K01TK5", "Mutual fund", 1, 100.0, 0.1, ""],
+        ["", "GRAND TOTAL", "", 17, 1000.0, 1.0, ""],
+        ["NAV PER UNIT (Rs.)", "", "", "", 99.0, "", ""],
+    ]
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(
+            writer,
+            sheet_name="05",
+            index=False,
+            header=False,
+        )
+    return buffer.getvalue()
+
+
 class SampleTests(unittest.TestCase):
+    def test_ui_currency_uses_indian_numbering(self):
+        self.assertEqual(_format_inr(12_345.67), "Rs 12,345.67")
+        self.assertEqual(_format_inr(123_456.78), "Rs 1.23 Lakh")
+        self.assertEqual(_format_inr(12_345_678.9), "Rs 1.23 Crore")
+        self.assertEqual(_format_inr(-123_456.78), "-Rs 1.23 Lakh")
+        self.assertEqual(_format_inr(123_456, decimals=0), "Rs 1.23 Lakh")
+
     def test_xirr_calculates_dated_annual_return(self):
         result = xirr(
             [
@@ -456,6 +563,18 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
                 delta=0.1,
             )
             family = by_name["Family total"]
+            bucket_table = _allocation_bucket_table(rows).controls[0]
+            total_table = _allocation_total_table(rows).controls[0]
+            self.assertEqual(len(bucket_table.columns), 6)
+            self.assertEqual(len(total_table.columns), 6)
+            self.assertEqual(len(bucket_table.rows), 6)
+
+            summary_table = _holdings_summary_table(
+                db.current_holding_rows(connection),
+                include_family=True,
+            )
+            self.assertEqual(len(summary_table.rows), 3)
+            self.assertEqual(summary_table.rows[0].cells[0].content.value, "Family")
             for asset in ("Equity", "Corporate", "Government"):
                 self.assertGreater(family["asset_totals"][asset]["current_value"], 0)
                 self.assertAlmostEqual(
@@ -506,6 +625,200 @@ Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI
                 )
             )
             connection.close()
+
+    def test_icici_disclosure_parses_stocks_and_bonds_from_xlsx(self):
+        equity_sheet = pd.DataFrame(
+            [
+                ["Name of the Pension Fund", "ICICI Pension Fund"],
+                ["Name of the scheme", "Scheme E- Tier I"],
+                ["Portfolio Statement as on", datetime(2026, 9, 30)],
+                [""] * 7,
+                [""] * 7,
+                ["Particulars", "ISIN No.", "Industry", "Quantity", "Market Value", "% of Portfolio", "Rating"],
+                ["Equity Instruments"],
+                ["Shares"],
+                ["Sample Equity Ltd", "INE000A01000", "Technology", 10, 600.0, 0.6, ""],
+                ["Subtotal", "", "", 10, 600.0, 0.6, ""],
+                ["Debt Instruments"],
+                ["Sample Corporate Bond", "INE000B01000", "Finance", 4, 300.0, 0.3, "AAA"],
+                ["Cash/Cash equivalent & Net Current Assets", "", "", "", 100.0, 0.1, ""],
+                ["GRAND TOTAL", "", "", 14, 1000.0, 1.0, ""],
+                ["Equity", "", "", "", "", "", ""],
+                ["Duplicate summary row", "", "", "", 600.0, 0.6, ""],
+            ]
+        )
+        government_sheet = pd.DataFrame(
+            [
+                ["Name of the Pension Fund", "ICICI Pension Fund"],
+                ["Name of the scheme", "Scheme G- Tier I"],
+                ["Portfolio Statement as on", datetime(2026, 9, 30)],
+                [""] * 7,
+                [""] * 7,
+                ["Particulars", "ISIN No.", "Industry", "Quantity", "Market Value", "% of Portfolio", "Rating"],
+                ["Government Securities"],
+                ["Central Government Securities"],
+                ["7% GS 2030", "IN0020260001", "Government", 10, 1000.0, 1.0, "SOV"],
+                ["GRAND TOTAL", "", "", 10, 1000.0, 1.0, ""],
+            ]
+        )
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            equity_sheet.to_excel(writer, sheet_name="Scheme E - Tier l", index=False, header=False)
+            government_sheet.to_excel(writer, sheet_name="Scheme G - Tier l", index=False, header=False)
+
+        result = parse_icici_disclosure(buffer.getvalue(), "portfolio.xlsx")
+        self.assertEqual(result.as_of_date, date(2026, 9, 30))
+        self.assertEqual(len(result.positions), 4)
+        equity = next(row for row in result.positions if row.isin == "INE000A01000")
+        corporate = next(row for row in result.positions if row.isin == "INE000B01000")
+        government = next(row for row in result.positions if row.isin == "IN0020260001")
+        self.assertEqual(equity.instrument_type, "Equity")
+        self.assertEqual(corporate.instrument_type, "Corporate bond")
+        self.assertEqual(government.instrument_type, "Government bond")
+        self.assertAlmostEqual(equity.portfolio_weight, 0.6)
+        self.assertAlmostEqual(corporate.portfolio_weight, 0.3)
+
+    def test_hdfc_disclosure_parses_current_month_workbook(self):
+        result = parse_hdfc_disclosure(_hdfc_workbook(), "monthly.xlsx")
+        self.assertEqual(result.fund_manager, "HDFC")
+        self.assertEqual(result.as_of_date, date(2026, 9, 30))
+        self.assertEqual(
+            {(row.scheme_asset, row.tier) for row in result.positions},
+            {("E", "nps_tier1"), ("G", "nps_tier2")},
+        )
+        government = next(row for row in result.positions if row.isin == "IN0020260001")
+        self.assertEqual(government.instrument_type, "Government bond")
+
+    def test_lic_disclosure_parses_single_scheme_file_and_stops_at_total(self):
+        result = parse_lic_disclosure(
+            _lic_workbook(),
+            ("E", "nps_tier1"),
+            "scheme.xlsx",
+        )
+        self.assertEqual(result.fund_manager, "LIC")
+        self.assertEqual(result.as_of_date, date(2026, 9, 30))
+        self.assertEqual(len(result.positions), 4)
+        self.assertEqual(
+            {row.instrument_type for row in result.positions},
+            {"Equity", "Corporate bond", "Government bond", "Money market"},
+        )
+        self.assertAlmostEqual(
+            sum(row.portfolio_weight for row in result.positions),
+            1.0,
+        )
+
+    def test_security_disclosure_storage_and_account_lookthrough(self):
+        with tempfile.TemporaryDirectory() as folder:
+            connection = db.connect(Path(folder) / "portfolio.db")
+            disclosure = parse_icici_disclosure(
+                _security_workbook(),
+                "portfolio.xlsx",
+            )
+            save_security_disclosure(connection, disclosure)
+            save_security_disclosure(
+                connection,
+                parse_hdfc_disclosure(_hdfc_workbook(), "monthly.xlsx"),
+            )
+            save_security_disclosure(
+                connection,
+                parse_lic_disclosure(
+                    _lic_workbook(),
+                    ("E", "nps_tier1"),
+                    "scheme.xlsx",
+                ),
+            )
+            saved = db.latest_security_disclosures(connection)
+            holdings = [
+                {
+                    "scheme_name": "ICICI PENSION FUND SCHEME E - TIER I",
+                    "tier": "nps_tier1",
+                    "member_id": "SAMPLE-ACCOUNT-001",
+                    "units": 10.0,
+                    "latest_nav": 100.0,
+                    "statement_nav": 100.0,
+                },
+                {
+                    "scheme_name": "ICICI PENSION FUND SCHEME E - TIER I",
+                    "tier": "nps_tier1",
+                    "member_id": "SAMPLE-ACCOUNT-002",
+                    "units": 5.0,
+                    "latest_nav": 100.0,
+                    "statement_nav": 100.0,
+                },
+                {
+                    "scheme_name": "HDFC PENSION FUND SCHEME E - TIER I",
+                    "tier": "nps_tier1",
+                    "member_id": "SAMPLE-ACCOUNT-003",
+                    "units": 10.0,
+                    "latest_nav": 100.0,
+                    "statement_nav": 100.0,
+                },
+                {
+                    "scheme_name": "LIC PENSION FUND SCHEME E - TIER I",
+                    "tier": "nps_tier1",
+                    "member_id": "SAMPLE-ACCOUNT-004",
+                    "units": 10.0,
+                    "latest_nav": 100.0,
+                    "statement_nav": 100.0,
+                },
+            ]
+            family = build_security_exposure(holdings, saved)
+            first_member = build_security_exposure(
+                holdings,
+                saved,
+                member_id="SAMPLE-ACCOUNT-001",
+            )
+            self.assertAlmostEqual(family["total_value"], 3500)
+            self.assertAlmostEqual(family["covered_value"], 3500)
+            self.assertAlmostEqual(family["coverage"], 1.0)
+            self.assertAlmostEqual(family["positions"][0]["exposure"], 2500)
+            self.assertAlmostEqual(
+                sum(position["exposure"] for position in family["positions"]),
+                family["covered_value"],
+            )
+            self.assertAlmostEqual(first_member["positions"][0]["exposure"], 600)
+            self.assertEqual(first_member["disclosure_date"], "2026-09-30")
+            connection.close()
+
+    def test_portfolio_ui_filters_member_tier_scheme_and_year(self):
+        app = object.__new__(PortfolioApp)
+        app.selected_member = "SAMPLE-ACCOUNT-001"
+        app.selected_tier = "nps_tier1"
+        app.selected_scheme = "ICICI SCHEME E"
+        app.selected_financial_year = "2025-26"
+        rows = [
+            {
+                "member_id": "SAMPLE-ACCOUNT-001",
+                "tier": "nps_tier1",
+                "scheme_name": "ICICI SCHEME E",
+                "financial_year": "2025-26",
+            },
+            {
+                "member_id": "SAMPLE-ACCOUNT-001",
+                "tier": "nps_tier2",
+                "scheme_name": "ICICI SCHEME E",
+                "financial_year": "2025-26",
+            },
+            {
+                "member_id": "SAMPLE-ACCOUNT-002",
+                "tier": "nps_tier1",
+                "scheme_name": "ICICI SCHEME E",
+                "financial_year": "2025-26",
+            },
+            {
+                "member_id": "SAMPLE-ACCOUNT-001",
+                "tier": "nps_tier1",
+                "scheme_name": "ICICI SCHEME C",
+                "financial_year": "2025-26",
+            },
+            {
+                "member_id": "SAMPLE-ACCOUNT-001",
+                "tier": "nps_tier1",
+                "scheme_name": "ICICI SCHEME E",
+                "financial_year": "2024-25",
+            },
+        ]
+        self.assertEqual(app._filter_rows(rows), rows[:1])
 
 
 if __name__ == "__main__":

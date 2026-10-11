@@ -10,6 +10,7 @@ from portfolio_app import db
 from portfolio_app.export import holding_records, transaction_records, write_table
 from portfolio_app.nav import FundNav, fetch_latest, match_scheme
 from portfolio_app.parsers.nps import parse_nps_file
+from portfolio_app.securities import PortfolioDisclosure
 
 
 class ImportRejected(Exception):
@@ -77,6 +78,13 @@ def refresh_navs(connection, funds: list[FundNav] | None = None) -> dict:
             unmatched.append(name)
     connection.commit()
     return {"linked": linked, "ambiguous": ambiguous, "unmatched": unmatched, "catalog": catalog}
+
+
+def save_security_disclosure(
+    connection,
+    disclosure: PortfolioDisclosure,
+) -> None:
+    db.save_security_disclosure(connection, disclosure, datetime.now())
 
 
 def export_holdings(
