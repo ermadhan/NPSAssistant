@@ -6,10 +6,11 @@ The importer supports the current CRA statement layout and the legacy FY 2020-21
 
 ## Portfolio views
 
+- **User guide:** [Screen-by-screen instructions](docs/user-guide/README.md).
 - **Overview** shows scheme positions, current value, estimated net invested, calculated XIRR, and the XIRR reported in the latest statement.
 - **Allocation** rolls each member and the family up by Tier 1/Tier 2 and Equity, Corporate, Government, and Alternative scheme categories. Current value uses the latest NAV when available and otherwise falls back to the statement NAV.
 - **Statements** retains imported statement history and transactions.
-this - **Securities** estimates stock, government-bond, corporate-bond, and money-market exposure from the latest supported official pension-fund portfolio report. It combines each disclosure's scheme weights with the current value of the family's scheme holdings.
+- **Securities** estimates stock, government-bond, corporate-bond, and money-market exposure from the latest supported official pension-fund portfolio report. It combines each disclosure's scheme weights with the current value of the family's scheme holdings.
 
 Overview, Allocation, Securities, and statement history share compact dropdown filters for member name, tier, scheme, and financial year. Selecting a financial year shows the matching statement snapshots; the securities view clearly notes that its disclosure weights may be from a different date. XIRRs are summarized together, and per-scheme values use a single calculated/reported XIRR column.
 
