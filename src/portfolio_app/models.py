@@ -12,6 +12,7 @@ class HoldingRow:
     units: float
     statement_nav: float
     market_value: float
+    net_contribution: Optional[float] = None
     scheme_code: Optional[str] = None
 
 

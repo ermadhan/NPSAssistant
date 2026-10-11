@@ -1,6 +1,9 @@
+import csv
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,7 +11,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from portfolio_app import db  # noqa: E402
 from portfolio_app.nav import FundNav, match_scheme  # noqa: E402
-from portfolio_app.parsers.nps import financial_year_for, parse_nps_file  # noqa: E402
+from portfolio_app.parsers.nps import (  # noqa: E402
+    financial_year_for,
+    parse_nps_file,
+    parse_nps_text,
+)
 from portfolio_app.service import (  # noqa: E402
     export_holdings,
     export_transactions,
@@ -37,6 +44,106 @@ FUNDS = [
 
 
 class SampleTests(unittest.TestCase):
+    def test_legacy_2020_statement_layout(self):
+        statement = """NPS Transaction Statement for Tier I Account
+Subscriber Details
+PRAN,'SAMPLE-ACCOUNT-001
+Subscriber Name,Sample Member
+Statement Generation Date :September 17  2020 07:18 AM
+Scheme Choice - ACTIVE CHOICE
+Investment Summary
+Value of your Holdings(Investments)as on September 17 2020 (in Rs),No of contributions,Total contribution in your account as on September 17 2020 (in Rs),Total withdrawal as on September 17 2020 (in Rs),Total notional gain/loss as on September 17 2020 (in Rs),Withdrawal/ deduction in units towards intermediary charges (in Rs),Return on Investment(XIRR),12.5%
+Rs 300,1,Rs 200,Rs 0,Rs 100,Rs 2,
+Investment Details- Scheme Wise Summary
+Particulars,References,SBI PENSION FUND SCHEME E - TIER I,SBI PENSION FUND SCHEME C - TIER I,SBI PENSION FUND SCHEME G - TIER I,
+Scheme wise Value of your Holdings(Investments) (in Rs),E=U*N,100,100,100,
+Scheme wise Contribution in your account (in Rs),F,80,70,50,
+Unrealized Gain/Loss (in Rs),,20,30,50,
+Total Units,U,10,20,30,
+NAV as on 16-Sep-2020,N,10,5,3.3333,
+Note: Scheme wise Contribution in your account varies after scheme changes.
+Contribution/ Redemption Details
+Date,Particulars,Uploaded By,Employee Contribution(Rs),Employer's Contribution(Rs),Total(Rs)
+01-Apr-2020,By Voluntary Contribution,Subscriber,100,100,200
+Note: closing balance of Contribution/Redemption details
+Transaction Details
+Date,Particulars,Withdrawal/deduction in units towards intermediary charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI PENSION FUND SCHEME E - TIER I NAV (Rs),SBI PENSION FUND SCHEME E - TIER I Units,SBI PENSION FUND SCHEME C - TIER I Amount (Rs),SBI PENSION FUND SCHEME C - TIER I NAV (Rs),SBI PENSION FUND SCHEME C - TIER I Units,SBI PENSION FUND SCHEME G - TIER I Amount (Rs),SBI PENSION FUND SCHEME G - TIER I NAV (Rs),SBI PENSION FUND SCHEME G - TIER I Units
+01-Apr-2020,By Voluntary Contribution,,100,10,10,100,5,20,100,3.3333,30
+02-Apr-2020,On account of rebalancing of schemes,-,-5,10,-0.5,5,5,1,,,
+"""
+        result = parse_nps_text(statement, "legacy-2020.csv")
+        self.assertFalse(result.needs_header_map, result.header_mapping)
+        self.assertEqual(result.financial_year, "2020-21")
+        self.assertEqual(result.xirr, 12.5)
+        self.assertEqual(len(result.holdings), 3)
+        self.assertAlmostEqual(sum(row.market_value for row in result.holdings), 300)
+        self.assertEqual(
+            [row.net_contribution for row in result.holdings],
+            [80, 70, 50],
+        )
+        self.assertEqual(result.nav_date, date(2020, 9, 16))
+        self.assertEqual(len(result.contributions), 1)
+        self.assertEqual(len(result.transactions), 5)
+        self.assertEqual(
+            {row.narration_kind for row in result.transactions},
+            {"voluntary", "switch_in", "switch_out"},
+        )
+        self.assertEqual(result.unknown_narrations, [])
+        self.assertEqual(result.warnings, [])
+
+    def test_legacy_net_contribution_is_saved_and_old_database_migrates(self):
+        statement = """NPS Transaction Statement for Tier I Account
+Subscriber Details
+PRAN,'SAMPLE-ACCOUNT-001
+Subscriber Name,Sample Member
+Investment Summary
+Value of your Holdings(Investments)as on September 17 2020 (in Rs),No of contributions,Total contribution in your account as on September 17 2020 (in Rs),Total withdrawal as on September 17 2020 (in Rs),Total notional gain/loss as on September 17 2020 (in Rs),Withdrawal/ deduction in units towards intermediary charges (in Rs),Return on Investment(XIRR),12.5%
+Rs 300,1,Rs 200,Rs 0,Rs 100,Rs 2,
+Investment Details- Scheme Wise Summary
+Particulars,References,SBI PENSION FUND SCHEME E - TIER I,SBI PENSION FUND SCHEME C - TIER I,SBI PENSION FUND SCHEME G - TIER I,
+Scheme wise Value of your Holdings(Investments) (in Rs),E=U*N,100,100,100,
+Scheme wise Contribution in your account (in Rs),F,80,70,50,
+Total Units,U,10,20,30,
+NAV as on 16-Sep-2020,N,10,5,3.3333,
+Contribution/ Redemption Details
+Date,Particulars,Uploaded By,Employee Contribution(Rs),Employer's Contribution(Rs),Total(Rs)
+01-Apr-2020,By Voluntary Contribution,Subscriber,100,100,200
+Transaction Details
+Date,Particulars,Charges (Rs),SBI PENSION FUND SCHEME E - TIER I Amount (Rs),SBI PENSION FUND SCHEME E - TIER I NAV (Rs),SBI PENSION FUND SCHEME E - TIER I Units
+01-Apr-2020,By Voluntary Contribution,,100,10,10
+"""
+        result = parse_nps_text(statement, "legacy-2020.csv")
+        with tempfile.TemporaryDirectory() as folder:
+            database_path = Path(folder) / "portfolio.db"
+            legacy = db.connect(database_path)
+            legacy.execute(
+                "ALTER TABLE holdings DROP COLUMN net_contribution"
+            )
+            legacy.close()
+            connection = db.connect(database_path)
+            import_id = db.save_import(
+                connection, result, "legacy-2020.csv", "legacy-hash"
+            )
+            rows = connection.execute(
+                "SELECT net_contribution FROM holdings ORDER BY id"
+            ).fetchall()
+            self.assertEqual([row["net_contribution"] for row in rows], [80, 70, 50])
+            export_path = Path(folder) / "legacy-holdings.csv"
+            export_holdings(connection, export_path, import_id)
+            with export_path.open(encoding="utf-8", newline="") as file:
+                self.assertEqual(
+                    {
+                        row["scheme"]: float(row["net_contribution"])
+                        for row in csv.DictReader(file)
+                    },
+                    {
+                        "SBI PENSION FUND SCHEME E - TIER I": 80,
+                        "SBI PENSION FUND SCHEME C - TIER I": 70,
+                        "SBI PENSION FUND SCHEME G - TIER I": 50,
+                    },
+                )
+            connection.close()
+
     def test_holdings_totals_and_charges(self):
         parsed = {}
         for name, (tier, year, total, filename_year) in SAMPLES.items():
@@ -107,6 +214,48 @@ class SampleTests(unittest.TestCase):
             workbook = Path(folder) / "transactions.xlsx"
             export_transactions(connection, workbook)
             self.assertTrue(workbook.stat().st_size > 0)
+            connection.close()
+
+    def test_current_holdings_are_isolated_by_subscriber(self):
+        with tempfile.TemporaryDirectory() as folder:
+            connection = db.connect(Path(folder) / "portfolio.db")
+            result = parse_nps_file(ROOT / "SAMPLE-ACCOUNT-001_Tier1.csv")
+            db.save_import(connection, result, "member-one.csv", "hash-member-one")
+
+            member_two = replace(result, pran="member_two-PRAN", subscriber_name="member_two")
+            db.save_import(connection, member_two, "member_two.csv", "hash-member_two")
+            newer_wife = replace(member_two, as_of_date=date(2026, 10, 1))
+            db.save_import(connection, newer_wife, "member_two-new.csv", "hash-member_two-new")
+
+            rows = db.current_holding_rows(connection)
+            self.assertEqual(
+                {row["subscriber_name"] for row in rows},
+                {result.subscriber_name, "member_two"},
+            )
+            self.assertEqual(
+                {row["subscriber_name"] for row in db.list_years(connection)},
+                {result.subscriber_name, "member_two"},
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM imports WHERE is_current = 1"
+                ).fetchone()[0],
+                2,
+            )
+            holdings_path = Path(folder) / "member_two-holdings.csv"
+            export_holdings(connection, holdings_path, member_id="member_two-PRAN")
+            with holdings_path.open(encoding="utf-8", newline="") as file:
+                self.assertEqual(
+                    {row["subscriber"] for row in csv.DictReader(file)},
+                    {"member_two"},
+                )
+            transactions_path = Path(folder) / "member_two-transactions.csv"
+            export_transactions(connection, transactions_path, member_id="member_two-PRAN")
+            with transactions_path.open(encoding="utf-8", newline="") as file:
+                self.assertEqual(
+                    {row["subscriber"] for row in csv.DictReader(file)},
+                    {"member_two"},
+                )
             connection.close()
 
 

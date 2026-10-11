@@ -78,12 +78,24 @@ def refresh_navs(connection, funds: list[FundNav] | None = None) -> dict:
     return {"linked": linked, "ambiguous": ambiguous, "unmatched": unmatched, "catalog": catalog}
 
 
-def export_holdings(connection, path: Path, import_id: int | None = None) -> None:
+def export_holdings(
+    connection,
+    path: Path,
+    import_id: int | None = None,
+    member_id: str | None = None,
+) -> None:
     rows = db.holdings_for_import(connection, import_id) if import_id else db.current_holding_rows(connection)
+    if member_id is not None:
+        rows = [row for row in rows if row["member_id"] == member_id]
     write_table(path, holding_records(rows))
 
 
-def export_transactions(connection, path: Path, import_id: int | None = None) -> None:
+def export_transactions(
+    connection,
+    path: Path,
+    import_id: int | None = None,
+    member_id: str | None = None,
+) -> None:
     if import_id:
         rows = db.transactions_for_import(connection, import_id)
         year = connection.execute(
@@ -94,7 +106,10 @@ def export_transactions(connection, path: Path, import_id: int | None = None) ->
             record["financial_year"] = "" if year is None else year["financial_year"]
         write_table(path, records)
         return
-    write_table(path, transaction_records(db.all_current_transactions(connection)))
+    rows = db.all_current_transactions(connection)
+    if member_id is not None:
+        rows = [row for row in rows if row["member_id"] == member_id]
+    write_table(path, transaction_records(rows))
 
 
 def _norm(value: str) -> str:

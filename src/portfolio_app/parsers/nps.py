@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import re
+from io import StringIO
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -97,30 +99,47 @@ def parse_nps_text(
     scheme_map = _map_headers(scheme_headers, aliases["schemes"]["aliases"])
     contrib_map = _map_headers(contrib_headers, aliases["contributions"]["aliases"])
     txn_map = _map_headers(txn_headers, aliases["transactions"]["aliases"])
+    legacy_holdings, legacy_nav_date = _legacy_scheme_holdings(scheme_headers, scheme_rows)
+    legacy_transactions = _legacy_transactions(
+        sections["transactions"],
+        narrations,
+        narration_aliases or {},
+    )
     missing = {
         "summary": _missing(aliases["summary"]["required"], summary_map),
         "schemes": _missing(aliases["schemes"]["required"], scheme_map),
         "contributions": _missing(aliases["contributions"]["required"], contrib_map),
         "transactions": _missing(aliases["transactions"]["required"], txn_map),
     }
+    if legacy_holdings is not None:
+        missing.pop("schemes")
+    if legacy_transactions is not None:
+        missing.pop("transactions")
     missing = {key: value for key, value in missing.items() if value}
     header_mapping = None
     if missing:
         header_mapping = HeaderMappingRequest(fingerprint, section_headers, missing)
 
     as_of = _as_of_date(summary_headers, summary_map)
-    nav_date = _nav_date(scheme_headers, scheme_map)
+    nav_date = legacy_nav_date or _nav_date(scheme_headers, scheme_map)
     xirr = _xirr(summary_headers)
-    holdings = _holdings(scheme_rows, scheme_map, tier) if not missing.get("schemes") else []
+    holdings = (
+        legacy_holdings
+        if legacy_holdings is not None
+        else _holdings(scheme_rows, scheme_map, tier) if not missing.get("schemes") else []
+    )
     contributions = (
         _contributions(contrib_rows, contrib_map) if not missing.get("contributions") else []
     )
-    transactions, unknown = _transactions(
-        txn_blocks,
-        txn_map,
-        narrations,
-        narration_aliases or {},
-    )
+    if legacy_transactions is not None:
+        transactions, unknown = legacy_transactions
+    else:
+        transactions, unknown = _transactions(
+            txn_blocks,
+            txn_map,
+            narrations,
+            narration_aliases or {},
+        )
     txn_dates = [row.txn_date for row in transactions]
     period_start = min(txn_dates) if txn_dates else as_of
     period_end = max(txn_dates) if txn_dates else as_of
@@ -219,9 +238,9 @@ def _split_sections(lines: list[str]) -> dict[str, list[str]]:
     )
     found: list[tuple[str, int]] = []
     for index, line in enumerate(lines):
-        lowered = _norm(line)
+        lowered = _compact(line)
         for key, marker in markers:
-            if marker in lowered and not any(name == key for name, _ in found):
+            if lowered.startswith(_compact(marker)) and not any(name == key for name, _ in found):
                 found.append((key, index))
     sections = {"preamble": lines[: found[0][1] if found else len(lines)]}
     for position, (key, start) in enumerate(found):
@@ -330,11 +349,145 @@ def _holdings(rows: list[list[str]], mapping: dict[str, int], tier: str) -> list
     return holdings
 
 
+def _classify_transaction(
+    description: str,
+    amount: Optional[float],
+    narrations: dict,
+    extra: dict[str, str],
+) -> str:
+    kind = classify_narration(description, narrations, extra)
+    if (
+        kind == "other"
+        and amount is not None
+        and amount != 0
+        and "rebalancing" in _norm(description)
+    ):
+        return "switch_in" if amount > 0 else "switch_out"
+    return kind
+
+
+def _legacy_scheme_holdings(
+    headers: list[str],
+    rows: list[list[str]],
+) -> tuple[Optional[list[HoldingRow]], Optional[date]]:
+    if len(headers) < 3 or _compact(headers[0]) != "particulars" or _compact(headers[1]) != "references":
+        return None, None
+    scheme_columns = [
+        (index, name.strip())
+        for index, name in enumerate(headers[2:], 2)
+        if _is_scheme_line(name)
+    ]
+    if not scheme_columns:
+        return None, None
+
+    metrics = {}
+    nav_date = None
+    for row in rows:
+        label = _compact(_cell(row, 0))
+        if label.startswith("schemewisevalueofyourholdings"):
+            metrics["market_value"] = row
+        elif label.startswith("schemewisecontributioninyouraccount"):
+            metrics["net_contribution"] = row
+        elif label == "totalunits":
+            metrics["units"] = row
+        elif label.startswith("navason"):
+            metrics["nav"] = row
+            nav_date = _find_date(_cell(row, 0))
+    if not {"market_value", "units", "nav"}.issubset(metrics):
+        return None, None
+
+    holdings = []
+    for index, scheme_name in scheme_columns:
+        market_value = _money(_cell(metrics["market_value"], index))
+        units = _number(_cell(metrics["units"], index))
+        nav = _number(_cell(metrics["nav"], index))
+        if market_value is None or units is None or nav is None:
+            raise ValueError(
+                f"Legacy holdings summary is missing a numeric value for {scheme_name!r}."
+            )
+        holdings.append(
+            HoldingRow(
+                scheme_name=scheme_name,
+                asset_class=_asset_class(scheme_name),
+                units=units,
+                statement_nav=nav,
+                market_value=market_value,
+                net_contribution=(
+                    _money(_cell(metrics["net_contribution"], index))
+                    if "net_contribution" in metrics
+                    else None
+                ),
+            )
+        )
+    return holdings, nav_date
+
+
+def _legacy_transactions(
+    lines: list[str],
+    narrations: dict,
+    extra: dict[str, str],
+) -> Optional[tuple[list[SchemeTransactionRow], list[str]]]:
+    rows = [_split_csv(line) for line in lines if line.strip()]
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if len(row) > 3
+            and _compact(_cell(row, 0)) == "date"
+            and _compact(_cell(row, 1)) in {"particulars", "description"}
+            and any(_is_scheme_line(cell) for cell in row[3:])
+        ),
+        None,
+    )
+    if header_index is None:
+        return None
+
+    header = rows[header_index]
+    scheme_groups: dict[str, dict[str, int]] = {}
+    for index, column in enumerate(header):
+        match = re.match(r"(.+?)\s+(amount|nav|units)(?:\s*\(.*\))?\s*$", column, re.I)
+        if not match or not _is_scheme_line(match.group(1)):
+            continue
+        scheme_groups.setdefault(match.group(1).strip(), {})[match.group(2).lower()] = index
+    if not scheme_groups or any(not {"amount", "nav", "units"}.issubset(group) for group in scheme_groups.values()):
+        return None
+
+    transactions = []
+    unknown = []
+    for row in rows[header_index + 1 :]:
+        raw_date = _cell(row, 0).strip()
+        description = _cell(row, 1).strip()
+        if not raw_date or not description or _is_note(raw_date):
+            continue
+        txn_date = _parse_date(raw_date)
+        for scheme_name, columns in scheme_groups.items():
+            amount = _money(_cell(row, columns["amount"]))
+            nav = _number(_cell(row, columns["nav"]))
+            units = _number(_cell(row, columns["units"]))
+            if amount is None and nav is None and units is None:
+                continue
+            kind = _classify_transaction(description, amount, narrations, extra)
+            if kind == "other" and description not in unknown:
+                unknown.append(description)
+            transactions.append(
+                SchemeTransactionRow(
+                    txn_date=txn_date,
+                    scheme_name=scheme_name,
+                    description=description,
+                    narration_kind=kind,
+                    amount=amount,
+                    nav=nav,
+                    units=units,
+                )
+            )
+    return transactions, unknown
+
+
 def _contributions(rows: list[list[str]], mapping: dict[str, int]) -> list[ContributionRow]:
     parsed = []
     for row in rows:
         raw_date = _cell(row, mapping.get("date")).strip()
-        if not raw_date:
+        if not raw_date or _is_note(raw_date):
             continue
         parsed.append(
             ContributionRow(
@@ -363,7 +516,8 @@ def _transactions(
             description = _cell(cells, mapping.get("description")).strip()
             if not raw_date or not description:
                 continue
-            kind = classify_narration(description, narrations, extra)
+            amount = _money(_cell(cells, mapping.get("amount")))
+            kind = _classify_transaction(description, amount, narrations, extra)
             if kind == "other" and description not in unknown:
                 unknown.append(description)
             rows.append(
@@ -372,7 +526,7 @@ def _transactions(
                     scheme_name=scheme,
                     description=description,
                     narration_kind=kind,
-                    amount=_money(_cell(cells, mapping.get("amount"))),
+                    amount=amount,
                     nav=_number(_cell(cells, mapping.get("nav"))),
                     units=_number(_cell(cells, mapping.get("units"))),
                 )
@@ -497,7 +651,7 @@ def _check_year(dates: list[date], financial_year: str, warnings: list[str]) -> 
 
 
 def _split_csv(line: str) -> list[str]:
-    return [cell.strip() for cell in line.split(",")]
+    return [cell.strip() for cell in next(csv.reader(StringIO(line)))]
 
 
 def _cell(row: list[str], index: Optional[int]) -> str:
@@ -508,6 +662,14 @@ def _cell(row: list[str], index: Optional[int]) -> str:
 
 def _norm(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _compact(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _is_note(value: str) -> bool:
+    return _norm(value).startswith("note")
 
 
 def _money(value: str) -> Optional[float]:

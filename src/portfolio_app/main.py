@@ -57,6 +57,7 @@ class PortfolioApp:
         self.pending_path: Path | None = None
         self.pending = None
         self.selected_import: int | None = None
+        self.selected_member: str | None = None
         self.catalog = []
         self.narration_inputs: dict[str, ft.Dropdown] = {}
         self.header_inputs: dict[tuple[str, str], ft.Dropdown] = {}
@@ -80,6 +81,7 @@ class PortfolioApp:
 
     def show_holdings(self, _event=None) -> None:
         self.selected_import = None
+        self.selected_member = None
         self.status.value = "Showing current holdings."
         self._render_portfolio()
 
@@ -87,11 +89,35 @@ class PortfolioApp:
         years = db.list_years(self.connection)
         if self.selected_import is None:
             rows = db.current_holding_rows(self.connection)
-            title = "Current units"
+            title = "Family holdings" if self.selected_member is None else "Member holdings"
+            current_rows = rows
         else:
             rows = db.holdings_for_import(self.connection, self.selected_import)
             title = "Statement holdings"
+            current_rows = []
+        if self.selected_import is None and self.selected_member is not None:
+            rows = [row for row in rows if row["member_id"] == self.selected_member]
         controls: list = [ft.Text(title, size=22, weight=ft.FontWeight.W_600)]
+        if self.selected_import is None:
+            members = {}
+            for row in current_rows:
+                members.setdefault(row["member_id"], row["subscriber_name"])
+            controls.append(
+                ft.Row(
+                    wrap=True,
+                    controls=[
+                        ft.TextButton("Family", on_click=self.show_holdings),
+                        *[
+                            ft.TextButton(
+                                name or "NPS subscriber",
+                                data=member_id,
+                                on_click=self._select_member,
+                            )
+                            for member_id, name in members.items()
+                        ],
+                    ],
+                )
+            )
         if years:
             controls.append(
                 ft.Row(
@@ -99,6 +125,7 @@ class PortfolioApp:
                     controls=[ft.Text("Year")]
                     + [
                         ft.TextButton(
+                            f"{row['subscriber_name'] or 'NPS subscriber'} "
                             f"{_tier_label(row['tier'])} {row['financial_year']}",
                             data=row["id"],
                             on_click=self._select_year,
@@ -110,15 +137,22 @@ class PortfolioApp:
             )
         if not rows:
             controls.append(ft.Text("Load a transaction statement CSV downloaded from the NPS website."))
+        elif self.selected_import is None and self.selected_member is not None:
+            self._append_member_holdings(controls, rows)
         else:
-            for tier in ("nps_tier1", "nps_tier2"):
-                tier_rows = [row for row in rows if row["tier"] == tier]
-                if not tier_rows:
-                    continue
-                total = sum(_row_value(row) for row in tier_rows)
-                controls.append(ft.Text(f"{_tier_label(tier)}  Rs {total:,.2f}", size=18))
-                controls.append(_holding_table(tier_rows))
-            controls.append(ft.Text(f"Combined  Rs {sum(_row_value(row) for row in rows):,.2f}", size=18))
+            if self.selected_import is None:
+                controls.append(ft.Text("Consolidated across family accounts", size=18, weight=ft.FontWeight.W_600))
+                self._append_tier_totals(controls, rows, include_combined=True)
+                members = {}
+                for row in rows:
+                    members.setdefault(row["member_id"], []).append(row)
+                for member_rows in members.values():
+                    name = member_rows[0]["subscriber_name"] or "NPS subscriber"
+                    controls.append(ft.Text(name, size=18, weight=ft.FontWeight.W_600))
+                    self._append_member_holdings(controls, member_rows)
+            else:
+                controls.append(ft.Text(rows[0]["subscriber_name"] or "NPS subscriber", size=18))
+                self._append_member_holdings(controls, rows)
             missing = [row["scheme_name"] for row in rows if not row["latest_nav"]]
             if missing:
                 controls.append(ft.Text("Latest NAV is not stored yet for: " + "; ".join(missing)))
@@ -127,6 +161,21 @@ class PortfolioApp:
         controls.extend(self._scheme_code_section(rows))
         self.body.controls = controls
         self.page.update()
+
+    def _append_member_holdings(self, controls: list, rows) -> None:
+        self._append_tier_totals(controls, rows, include_combined=True)
+        for tier in ("nps_tier1", "nps_tier2"):
+            tier_rows = [row for row in rows if row["tier"] == tier]
+            if tier_rows:
+                controls.append(ft.Text(_tier_label(tier), size=16))
+                controls.append(_holding_table(tier_rows))
+
+    def _append_tier_totals(self, controls: list, rows, *, include_combined: bool) -> None:
+        for tier in ("nps_tier1", "nps_tier2"):
+            total = sum(_row_value(row) for row in rows if row["tier"] == tier)
+            controls.append(ft.Text(f"{_tier_label(tier)}  Rs {total:,.2f}", size=18))
+        if include_combined:
+            controls.append(ft.Text(f"Combined  Rs {sum(_row_value(row) for row in rows):,.2f}", size=18))
 
     def _movement_section(self, import_id: int) -> list:
         rows = db.transactions_for_import(self.connection, import_id)
@@ -194,7 +243,13 @@ class PortfolioApp:
 
     def _select_year(self, event) -> None:
         self.selected_import = event.control.data
+        self.selected_member = None
         self.status.value = "Showing selected statement."
+        self._render_portfolio()
+
+    def _select_member(self, event) -> None:
+        self.selected_member = event.control.data
+        self.status.value = "Showing selected NPS account."
         self._render_portfolio()
 
     async def load_statement(self, _event=None) -> None:
@@ -227,8 +282,15 @@ class PortfolioApp:
         result = self.pending
         self.narration_inputs = {}
         self.header_inputs = {}
+        account = result.subscriber_name or "NPS subscriber"
+        account += (
+            f" (PRAN ending {result.pran[-4:]})"
+            if result.pran
+            else " (PRAN not detected; matched by subscriber name)"
+        )
         controls = [
             ft.Text(f"Review {self.pending_path.name}", size=22, weight=ft.FontWeight.W_600),
+            ft.Text(f"Account: {account}"),
             ft.Text(
                 f"{_tier_label(result.tier)}  {result.financial_year}  "
                 f"as on {result.as_of_date.isoformat()}  "
@@ -384,7 +446,12 @@ class PortfolioApp:
             self.status.value = "Writing holdings export..."
             self.page.update()
             await asyncio.sleep(0)
-            export_holdings(self.connection, Path(target), self.selected_import)
+            export_holdings(
+                self.connection,
+                Path(target),
+                self.selected_import,
+                None if self.selected_import is not None else self.selected_member,
+            )
             self.status.value = f"Wrote {target}"
         except Exception as error:
             self.status.value = f"Holdings export failed: {error}"
@@ -407,7 +474,12 @@ class PortfolioApp:
             self.status.value = "Writing transactions export..."
             self.page.update()
             await asyncio.sleep(0)
-            export_transactions(self.connection, Path(target), self.selected_import)
+            export_transactions(
+                self.connection,
+                Path(target),
+                self.selected_import,
+                None if self.selected_import is not None else self.selected_member,
+            )
             self.status.value = f"Wrote {target}"
         except Exception as error:
             self.status.value = f"Transactions export failed: {error}"

@@ -66,6 +66,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
             statement_nav REAL NOT NULL,
             statement_nav_date TEXT,
             market_value REAL NOT NULL,
+            net_contribution REAL,
             scheme_code TEXT
         );
         CREATE TABLE IF NOT EXISTS contributions (
@@ -113,6 +114,11 @@ def _migrate(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    holding_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(holdings)")
+    }
+    if "net_contribution" not in holding_columns:
+        connection.execute("ALTER TABLE holdings ADD COLUMN net_contribution REAL")
     connection.commit()
 
 
@@ -154,8 +160,15 @@ def save_profile(connection: sqlite3.Connection, fingerprint: str, mapping_json:
 
 def save_import(connection: sqlite3.Connection, result: ParseResult, file_name: str, file_hash: str) -> int:
     connection.execute(
-        "UPDATE imports SET is_current = 0 WHERE tier = ? AND financial_year = ? AND is_current = 1",
-        (result.tier, result.financial_year),
+        """
+        UPDATE imports SET is_current = 0
+        WHERE tier = ? AND financial_year = ? AND is_current = 1
+          AND id IN (
+              SELECT import_id FROM account_snapshots
+              WHERE COALESCE(NULLIF(pran, ''), subscriber_name) = ?
+          )
+        """,
+        (result.tier, result.financial_year, result.pran or result.subscriber_name),
     )
     cursor = connection.execute(
         """
@@ -211,8 +224,8 @@ def save_import(connection: sqlite3.Connection, result: ParseResult, file_name: 
             """
             INSERT INTO holdings (
                 import_id, scheme_name, asset_class, tier, units, statement_nav,
-                statement_nav_date, market_value, scheme_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                statement_nav_date, market_value, net_contribution, scheme_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 import_id,
@@ -223,6 +236,7 @@ def save_import(connection: sqlite3.Connection, result: ParseResult, file_name: 
                 holding.statement_nav,
                 None if result.nav_date is None else result.nav_date.isoformat(),
                 holding.market_value,
+                holding.net_contribution,
                 links.get(holding.scheme_name),
             ),
         )
@@ -272,11 +286,12 @@ def save_import(connection: sqlite3.Connection, result: ParseResult, file_name: 
 def list_years(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT i.id, i.tier, i.financial_year, i.file_name, s.as_of_date, s.holdings_value
+        SELECT i.id, i.tier, i.financial_year, i.file_name, s.as_of_date, s.holdings_value,
+               s.subscriber_name, s.pran
         FROM imports i
         JOIN account_snapshots s ON s.import_id = i.id
         WHERE i.is_current = 1
-        ORDER BY s.as_of_date DESC, i.tier
+        ORDER BY s.as_of_date DESC, s.subscriber_name, i.tier
         """
     ).fetchall()
 
@@ -284,7 +299,9 @@ def list_years(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 def current_holding_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT h.*, s.as_of_date, i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date
+        SELECT h.*, s.as_of_date, s.subscriber_name, s.pran,
+               COALESCE(NULLIF(s.pran, ''), s.subscriber_name) AS member_id,
+               i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date
         FROM holdings h
         JOIN imports i ON i.id = h.import_id
         JOIN account_snapshots s ON s.import_id = i.id
@@ -298,8 +315,12 @@ def current_holding_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
                     SELECT MAX(s3.as_of_date) FROM account_snapshots s3
                     JOIN imports i3 ON i3.id = s3.import_id
                     WHERE i3.is_current = 1 AND i3.tier = i2.tier
+                      AND COALESCE(NULLIF(s3.pran, ''), s3.subscriber_name) =
+                          COALESCE(NULLIF(s2.pran, ''), s2.subscriber_name)
                 )
                 AND i2.tier = i.tier
+                AND COALESCE(NULLIF(s2.pran, ''), s2.subscriber_name) =
+                    COALESCE(NULLIF(s.pran, ''), s.subscriber_name)
           )
         ORDER BY h.tier, h.asset_class
         """
@@ -309,7 +330,9 @@ def current_holding_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 def holdings_for_import(connection: sqlite3.Connection, import_id: int) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT h.*, s.as_of_date, i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date
+        SELECT h.*, s.as_of_date, s.subscriber_name, s.pran,
+               COALESCE(NULLIF(s.pran, ''), s.subscriber_name) AS member_id,
+               i.financial_year, q.nav AS latest_nav, q.nav_date AS latest_nav_date
         FROM holdings h
         JOIN imports i ON i.id = h.import_id
         JOIN account_snapshots s ON s.import_id = i.id
@@ -324,9 +347,11 @@ def holdings_for_import(connection: sqlite3.Connection, import_id: int) -> list[
 def transactions_for_import(connection: sqlite3.Connection, import_id: int) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT * FROM scheme_transactions
-        WHERE import_id = ?
-        ORDER BY txn_date, scheme_name, id
+        SELECT t.*, s.subscriber_name
+        FROM scheme_transactions t
+        JOIN account_snapshots s ON s.import_id = t.import_id
+        WHERE t.import_id = ?
+        ORDER BY t.txn_date, t.scheme_name, t.id
         """,
         (import_id,),
     ).fetchall()
@@ -335,9 +360,11 @@ def transactions_for_import(connection: sqlite3.Connection, import_id: int) -> l
 def all_current_transactions(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return connection.execute(
         """
-        SELECT t.*, i.financial_year
+        SELECT t.*, i.financial_year, s.subscriber_name, s.pran,
+               COALESCE(NULLIF(s.pran, ''), s.subscriber_name) AS member_id
         FROM scheme_transactions t
         JOIN imports i ON i.id = t.import_id
+        JOIN account_snapshots s ON s.import_id = i.id
         WHERE i.is_current = 1
         ORDER BY t.txn_date, t.scheme_name, t.id
         """

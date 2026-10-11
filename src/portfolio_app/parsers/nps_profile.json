@@ -54,7 +54,7 @@
     "opening": ["opening balance"],
     "closing": ["closing balance"],
     "billing": ["billing for"],
-    "voluntary": ["by voluntary contributions"],
+    "voluntary": ["by voluntary contribution", "by voluntary contributions"],
     "employer": ["by contribution for"],
     "tier2": ["tier-2 contribution", "tier 2 contribution"],
     "switch_out": ["to withdrawal on account of subscriber initiated scheme preference change"],

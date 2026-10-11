@@ -26,11 +26,17 @@ def holding_records(rows) -> list[dict]:
         price = float(latest) if latest is not None else statement_nav
         records.append(
             {
+                "subscriber": row["subscriber_name"] if "subscriber_name" in row.keys() else "",
                 "tier": _tier_label(row["tier"]),
                 "financial_year": row["financial_year"],
                 "scheme": row["scheme_name"],
                 "asset_class": row["asset_class"],
                 "units": units,
+                "net_contribution": (
+                    None
+                    if row["net_contribution"] is None
+                    else float(row["net_contribution"])
+                ),
                 "statement_nav": statement_nav,
                 "statement_nav_date": row["statement_nav_date"],
                 "latest_nav": None if latest is None else float(latest),
@@ -47,6 +53,7 @@ def transaction_records(rows) -> list[dict]:
     for row in rows:
         records.append(
             {
+                "subscriber": row["subscriber_name"] if "subscriber_name" in row.keys() else "",
                 "tier": _tier_label(row["tier"]),
                 "financial_year": row["financial_year"] if "financial_year" in row.keys() else "",
                 "date": row["txn_date"],
